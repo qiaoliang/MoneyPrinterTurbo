@@ -125,4 +125,5 @@ include = [
 package = true
 # MoviePy 2.2.1 caps Pillow below 12; patched Pillow is required for image decoding.
 # Keep this in sync with requirements-security.txt for container/legacy installs.
-override-dependencies = ["pillow>=13.0.0,<14"]
+# macOS Intel (x86_64)：onnxruntime>=1.24 不再提供 macOS x86_64 wheel，钉到 1.23.x 以保证本机可安装。
+override-dependencies = ["pillow>=13.0.0,<14", "onnxruntime>=1.20,<1.24"]
