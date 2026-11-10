@@ -291,6 +291,51 @@ def _is_cloudflare_challenge(response: requests.Response) -> bool:
     return "just a moment" in body or "/cdn-cgi/challenge-platform/" in body
 
 
+def _stock_search_results(
+    provider: str, response: Any, results_key: str
+) -> list | None:
+    """
+    Return the result list of a Pexels or Coverr search response.
+
+    When the search failed, log why and return None. As in the Pixabay search,
+    the log gets the status and content type but not the response body, and a
+    401 names the setting that holds the rejected key.
+    """
+    status_code = int(getattr(response, "status_code", 200))
+    headers = getattr(response, "headers", {}) or {}
+    content_type = str(headers.get("content-type", "")) or "unknown"
+    if status_code == 401:
+        logger.error(
+            f"{provider} rejected the API key: status=401. "
+            f"Check {provider}_api_keys in config.toml."
+        )
+        return None
+    if status_code == 429:
+        logger.error(
+            f"{provider} API rate limit exceeded: "
+            f"status=429, retry_after={headers.get('retry-after') or 'unknown'}"
+        )
+        return None
+    if status_code >= 400:
+        logger.error(
+            f"{provider} search request failed: "
+            f"status={status_code}, content_type={content_type}"
+        )
+        return None
+    try:
+        body = response.json()
+    except ValueError:
+        logger.error(
+            f"{provider} returned an unexpected non-JSON response: "
+            f"status={status_code}, content_type={content_type}"
+        )
+        return None
+    if not isinstance(body, dict) or not isinstance(body.get(results_key), list):
+        logger.error(f"{provider} video search returned an unsupported response")
+        return None
+    return body[results_key]
+
+
 def _matches_video_aspect(
     width: Any,
     height: Any,
@@ -384,14 +429,10 @@ def search_videos_pexels(
             verify=_get_tls_verify(),
             timeout=(30, 60),
         )
-        response = r.json()
+        videos = _stock_search_results("pexels", r, "videos")
+        if videos is None:
+            return []
         video_items = []
-        if not isinstance(response, dict) or not isinstance(
-            response.get("videos"), list
-        ):
-            logger.error("pexels video search returned an unsupported response")
-            return video_items
-        videos = response["videos"]
         # loop through each video in the result
         for v in videos:
             if not isinstance(v, dict):
@@ -655,16 +696,12 @@ def search_videos_coverr(
             verify=_get_tls_verify(),
             timeout=(30, 60),
         )
-        response = r.json()
+        hits = _stock_search_results("coverr", r, "hits")
+        if hits is None:
+            return []
         video_items: List[MaterialInfo] = []
 
-        if not isinstance(response, dict) or not isinstance(
-            response.get("hits"), list
-        ):
-            logger.error("coverr video search returned an unsupported response")
-            return video_items
-
-        for v in response["hits"]:
+        for v in hits:
             if not isinstance(v, dict):
                 continue
             # duration 在不同响应里可能是 number(11.625) 或 string("10.500000")
@@ -2128,7 +2165,7 @@ def _search_terms_in_parallel(
                 logger.error(
                     "failed to search material videos: "
                     f"search_term={search_term!r}, "
-                    f"error={type(exc).__name__}"
+                    f"error={type(exc).__name__}, detail={exc}"
                 )
                 items = []
             logger.info(f"found {len(items)} videos for '{search_term}'")
@@ -3175,13 +3212,19 @@ def _download_videos_by_script_order(
         minimum_duration=max_clip_duration,
         video_aspect=video_aspect,
     ):
+        # A topic the script returns to gets the same search results again. Dedupe
+        # only within one term, so the repeated term keeps its slot on the timeline;
+        # candidates another term already took are skipped when a round is built.
         term_items = []
+        term_urls = set()
         for item in video_items:
-            if item.url in valid_video_urls:
+            if item.url in term_urls:
                 continue
             term_items.append(item)
-            valid_video_urls.add(item.url)
-            found_duration += item.duration
+            term_urls.add(item.url)
+            if item.url not in valid_video_urls:
+                valid_video_urls.add(item.url)
+                found_duration += item.duration
 
         if term_items:
             candidate_groups.append((search_term, term_items))
@@ -3200,18 +3243,22 @@ def _download_videos_by_script_order(
     # 每个关键词独立推进候选下标：只有本轮真正被选中下载的候选才推进，
     # 未被选中的候选保留到下一轮，避免被整轮统一的下标跳过。
     next_candidate_indices = [0] * len(candidate_groups)
+    picked_urls = set()
     while candidate_groups and total_duration <= audio_duration:
-        round_materials = [
-            (
-                group_position,
-                search_term,
-                term_items[next_candidate_indices[group_position]],
-            )
-            for group_position, (search_term, term_items) in enumerate(
-                candidate_groups
-            )
-            if next_candidate_indices[group_position] < len(term_items)
-        ]
+        round_materials = []
+        round_urls = set()
+        for group_position, (search_term, term_items) in enumerate(candidate_groups):
+            # Skip candidates an earlier round or an earlier group of this round took.
+            index = next_candidate_indices[group_position]
+            while index < len(term_items) and (
+                term_items[index].url in picked_urls
+                or term_items[index].url in round_urls
+            ):
+                index += 1
+            next_candidate_indices[group_position] = index
+            if index < len(term_items):
+                round_materials.append((group_position, search_term, term_items[index]))
+                round_urls.add(term_items[index].url)
         if not round_materials:
             break
 
@@ -3226,8 +3273,9 @@ def _download_videos_by_script_order(
         # _select_materials_until_duration 返回候选列表的前缀子集，
         # 因此前 len(selected_materials) 个即本轮实际尝试下载的候选，
         # 只推进这些候选所在分组的下标。
-        for group_position, _, _ in round_materials[: len(selected_materials)]:
+        for group_position, _, item in round_materials[: len(selected_materials)]:
             next_candidate_indices[group_position] += 1
+            picked_urls.add(item.url)
 
         downloaded_materials = _download_materials_in_parallel(
             materials=selected_materials,
